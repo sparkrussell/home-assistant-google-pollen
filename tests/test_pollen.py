@@ -10,14 +10,15 @@ from unittest.mock import AsyncMock, MagicMock
 import aiohttp
 from aiohttp import web
 import pytest
-from homeassistant.config_entries import SOURCE_USER, ConfigEntryState
+from homeassistant.config_entries import SOURCE_USER, ConfigEntry, ConfigEntryState
 import voluptuous as vol
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers.update_coordinator import UpdateFailed
 from homeassistant.util import dt as dt_util
 
+import custom_components.google_pollen as integration
 from custom_components.google_pollen import config_flow, coordinator, sensor, utils
-from custom_components.google_pollen.const import CONF_POLLEN, CONF_POLLEN_CATEGORIES
+from custom_components.google_pollen.const import CONF_POLLEN, CONF_POLLEN_CATEGORIES, DOMAIN
 
 # Synthetic only; deliberately matches the UI grammar, never loaded from config.
 SECRET = "AIza" + "SyntheticOnlyDoNotUseForGoogle".ljust(35, "x")
@@ -389,10 +390,12 @@ async def test_real_sensor_setup_first_refresh_failure(hass, monkeypatch, caplog
         state=ConfigEntryState.SETUP_IN_PROGRESS,
         data={**user_input(), CONF_POLLEN_CATEGORIES: ["GRASS"], CONF_POLLEN: []},
     )
-    add = MagicMock()
+    forward = AsyncMock()
+    monkeypatch.setattr(hass.config_entries, "async_forward_entry_setups", forward)
     with pytest.raises(ConfigEntryNotReady) as caught:
-        await sensor.async_setup_entry(hass, entry, add)
-    add.assert_not_called()
+        await integration.async_setup_entry(hass, entry)
+    forward.assert_not_awaited()
+    assert entry.entry_id not in hass.data[DOMAIN]
     assert SECRET not in "".join(traceback.format_exception(caught.value)) + caplog.text
 
 
@@ -486,19 +489,163 @@ async def test_real_ha_entity_state_and_time_callback(hass, monkeypatch):
 
 
 async def test_successful_initial_sensor_platform(hass, monkeypatch):
-    monkeypatch.setattr(coordinator, "fetch_pollen_data", AsyncMock(return_value=payload()))
+    fetch = AsyncMock(return_value=payload())
+    monkeypatch.setattr(coordinator, "fetch_pollen_data", fetch)
     entry = MagicMock(
         state=ConfigEntryState.SETUP_IN_PROGRESS,
         data={**user_input(), CONF_POLLEN_CATEGORIES: ["GRASS"], CONF_POLLEN: []},
     )
     add = MagicMock()
-    await sensor.async_setup_entry(hass, entry, add)
+
+    async def forward(config_entry, platforms):
+        await sensor.async_setup_entry(hass, config_entry, add)
+
+    monkeypatch.setattr(hass.config_entries, "async_forward_entry_setups", forward)
+    assert await integration.async_setup_entry(hass, entry)
     add.assert_called_once()
+    fetch.assert_awaited_once()
     entities = add.call_args.args[0]
     assert len(entities) == 1
+    assert entities[0].coordinator is hass.data[DOMAIN][entry.entry_id]
     assert entities[0].coordinator.data["GRASS"]["2026-10-26"]["index_value"] == 2
     assert entities[0].unique_id == "google_pollen_grass_1.123456_2.123456"
     await entities[0].coordinator.async_shutdown()
+
+
+def lifecycle_payload():
+    row = day()
+    row["pollenTypeInfo"] = [
+        day(code=code)["pollenTypeInfo"][0] for code in ("GRASS", "TREE", "WEED")
+    ]
+    return payload(row)
+
+
+def lifecycle_entry(hass):
+    """Register a real entry; do not mock setup, forwarding, or platform loading."""
+    from homeassistant import loader
+    from homeassistant.helpers import frame
+
+    loader.async_setup(hass)
+    frame.async_setup(hass)
+    # All test dependencies are preinstalled; never let HA launch an installer.
+    hass.config.skip_pip = True
+    entry = ConfigEntry(
+        data={**user_input(), CONF_POLLEN_CATEGORIES: ["GRASS", "TREE", "WEED"], CONF_POLLEN: []},
+        domain=DOMAIN,
+        title="Test Pollen",
+        version=1,
+        minor_version=1,
+        options={},
+        source=SOURCE_USER,
+        unique_id="test-pollen",
+        discovery_keys={},
+        subentries_data=[],
+    )
+    hass.config_entries._entries[entry.entry_id] = entry
+    return entry
+
+
+async def assert_loaded_and_unload(hass, entry):
+    """Verify actual sensor states, shared coordinator and unload cleanup."""
+    await hass.async_block_till_done()
+    assert entry.state is ConfigEntryState.LOADED
+    states = hass.states.async_all("sensor")
+    assert len(states) == 3
+    assert {s.state for s in states} == {"Low"}
+    assert {s.attributes["index_value"] for s in states} == {2}
+    assert SECRET not in str(states)
+    shared = hass.data[DOMAIN][entry.entry_id]
+    from homeassistant.helpers import entity_platform
+
+    entities = [
+        entity
+        for platform in entity_platform.async_get_platforms(hass, DOMAIN)
+        for entity in platform.entities.values()
+    ]
+    assert len(entities) == 3
+    assert all(entity.coordinator is shared for entity in entities)
+    assert len(shared._listeners) == 3
+    assert shared._unsub_refresh is not None
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+    assert entry.state is ConfigEntryState.NOT_LOADED
+    # HA retains registry placeholders on unload, not active sensor entities.
+    assert all(
+        state.state == "unavailable" and state.attributes.get("restored")
+        for state in hass.states.async_all("sensor")
+    )
+    assert entry.entry_id not in hass.data[DOMAIN]
+    assert not shared._listeners
+    assert shared._unsub_refresh is None
+    assert shared._shutdown_requested
+    assert all(
+        not platform.entities for platform in entity_platform.async_get_platforms(hass, DOMAIN)
+    )
+
+
+@pytest.mark.parametrize("failure", ["transient", "parser"])
+async def test_full_entry_lifecycle_retry_and_recovery(hass, monkeypatch, caplog, failure):
+    """First-refresh failures must reach HA, which schedules its own recovery."""
+    import logging
+    from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
+
+    caplog.set_level(logging.DEBUG)
+    entry = lifecycle_entry(hass)
+    good = lifecycle_payload()
+    first = (
+        utils.PollenError("fixed")
+        if failure == "transient"
+        else {"dailyInfo": [{"date": {"year": SECRET}}]}
+    )
+    fetch = AsyncMock(side_effect=[first, good])
+    monkeypatch.setattr(coordinator, "fetch_pollen_data", fetch)
+    monkeypatch.setattr(dt_util, "utcnow", lambda: NOW)
+    monkeypatch.setattr(dt_util, "now", lambda: NOW)
+
+    assert not await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    assert entry.state is ConfigEntryState.SETUP_RETRY
+    assert entry._async_cancel_retry_setup is not None
+    fetch.assert_awaited_once()
+    assert not hass.states.async_all("sensor")
+    assert entry.entry_id not in hass.data[DOMAIN]
+    assert SECRET not in caplog.text
+
+    # Exercise HA's registered startup retry, not a direct coordinator refresh.
+    hass.bus.async_fire(EVENT_HOMEASSISTANT_STARTED)
+    await hass.async_block_till_done(wait_background_tasks=True)
+    assert fetch.await_count == 2
+    await assert_loaded_and_unload(hass, entry)
+    assert SECRET not in caplog.text
+
+
+async def test_full_entry_lifecycle_auth_failure(hass, monkeypatch, caplog):
+    import logging
+
+    caplog.set_level(logging.DEBUG)
+    entry = lifecycle_entry(hass)
+    fetch = AsyncMock(side_effect=utils.PollenAuthError("fixed"))
+    monkeypatch.setattr(coordinator, "fetch_pollen_data", fetch)
+    assert not await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    fetch.assert_awaited_once()
+    assert entry.state is ConfigEntryState.SETUP_ERROR
+    assert "authentication" in entry.reason
+    assert entry._async_cancel_retry_setup is None
+    assert not hass.states.async_all("sensor")
+    assert entry.entry_id not in hass.data[DOMAIN]
+    assert SECRET not in caplog.text
+
+
+async def test_full_entry_lifecycle_success_and_unload(hass, monkeypatch):
+    entry = lifecycle_entry(hass)
+    fetch = AsyncMock(return_value=lifecycle_payload())
+    monkeypatch.setattr(coordinator, "fetch_pollen_data", fetch)
+    monkeypatch.setattr(dt_util, "utcnow", lambda: NOW)
+    monkeypatch.setattr(dt_util, "now", lambda: NOW)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    fetch.assert_awaited_once()
+    await assert_loaded_and_unload(hass, entry)
 
 
 async def test_reconfigure_no_credential_defaults_and_safe_error(hass, monkeypatch, caplog):

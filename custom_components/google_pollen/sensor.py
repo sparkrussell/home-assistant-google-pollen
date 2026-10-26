@@ -2,7 +2,6 @@
 
 from datetime import timedelta
 
-from homeassistant.const import CONF_API_KEY, CONF_LANGUAGE, CONF_LATITUDE, CONF_LONGITUDE
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity import Entity
 from homeassistant.helpers.event import async_track_time_interval
@@ -12,25 +11,16 @@ from homeassistant.util import dt as dt_util
 from .const import (
     CONF_POLLEN,
     CONF_POLLEN_CATEGORIES,
-    DEFAULT_LANGUAGE,
     DOMAIN,
     PLANT_TYPES,
     POLLEN_CATEGORIES,
 )
-from .coordinator import MAX_DATA_AGE, GooglePollenDataUpdateCoordinator
+from .coordinator import MAX_DATA_AGE
 
 
 async def async_setup_entry(hass: HomeAssistant, config_entry, async_add_entities):
     """Set up selected sensors only after a successful initial refresh."""
-    coordinator = GooglePollenDataUpdateCoordinator(
-        hass,
-        config_entry.data[CONF_API_KEY],
-        config_entry.data[CONF_LATITUDE],
-        config_entry.data[CONF_LONGITUDE],
-        config_entry.data.get(CONF_LANGUAGE, DEFAULT_LANGUAGE),
-        config_entry=config_entry,
-    )
-    await coordinator.async_config_entry_first_refresh()
+    coordinator = hass.data[DOMAIN][config_entry.entry_id]
     codes = list(
         dict.fromkeys(
             config_entry.data.get(CONF_POLLEN_CATEGORIES, POLLEN_CATEGORIES)

@@ -59,8 +59,10 @@ remain unperformed and separately gated by independent review.
    **Google Pollen** in Settings → Devices & Services. Enter key, coordinates
    and language. Select GRASS, TREE, WEED and only desired plant species.
    Initial setup validates the API; invalid/restricted auth returns a fixed
-   error, transient failure stays in the form. First runtime failure prevents
-   successful platform setup and uses HA's retry/auth failure semantics.
+   error, transient failure stays in the form. The integration creates and first-
+   refreshes its shared coordinator before forwarding sensor setup: transient or
+   parser failure leaves the entry in `SETUP_RETRY`, auth failure in `SETUP_ERROR`,
+   never a successfully loaded entry with zero sensors. HA owns retry scheduling.
 5. Verify actual entity IDs from the HA entity registry, not this document's
    guesses. Inspect only non-secret state/attributes. Confirm local forecast
    dates, explicit missing data, four-hour polling and unavailable behavior.
@@ -145,8 +147,11 @@ installation), obtain its public source checkout at
 ```
 
 Tests use real installed HA classes and aiohttp, mocked Google responses plus a
-loopback HTTP server, a synthetic sentinel and an external-connect guard. No
-Google key or live HA network access is required. This is bounded offline
+loopback HTTP server, a synthetic sentinel and an external-connect guard. Full
+`ConfigEntries.async_setup` regressions exercise initial transient/parser failure,
+HA's startup-triggered retry and recovery, auth failure, successful sensor creation
+and unload cleanup. These do not mock platform forwarding; HA's dependency
+installer is disabled. No Google key or live HA network access is required. This is bounded offline
 compatibility/security verification, not proof of geographic coverage, live
 billing/API access, a rendered HACS installation or a completed consumer cutover.
 
