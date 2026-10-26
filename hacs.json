@@ -1,0 +1,7 @@
+{
+  "name": "Google Pollen (Steve-owned hardened copy)",
+  "homeassistant": "2026.10.4",
+  "content_in_root": false,
+  "zip_release": false,
+  "render_readme": true
+}
